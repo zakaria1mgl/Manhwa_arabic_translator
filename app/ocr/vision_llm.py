@@ -16,27 +16,35 @@ log = logging.getLogger(__name__)
 
 _MAX_SIDE = 1568  # vision-token friendly; bboxes are scaled back to full res
 
-_PROMPT = """You are reading a manhwa/webtoon page image.
-Find EVERY piece of English text on the page: speech bubbles, narration
-boxes, captions, signs, sound effects (SFX), floating text.
+_PROMPT = """You are reading a manhwa/webtoon page image ({W}x{H} pixels).
+Find EVERY piece of English text on the page that should be translated:
+speech bubbles, thought bubbles, narration boxes, captions. Also include
+sound effects (SFX) ONLY when they are plain readable words (e.g. "BOOM").
+
+Do NOT include: lettering fused into logos or artwork, tiny background signs,
+watermarks, page numbers, or any text you cannot read with certainty.
 
 Return ONLY valid JSON:
 {"regions": [
   {"bbox": [x0, y0, x1, y1],          # integer pixels, top-left/bottom-right
    "text": "exact English text",       # join multi-line bubbles with spaces
    "type": "dialogue|thought|narration|caption|sfx|sign",
+   "confidence": 0.0,                  # your certainty this region+text is right
    "speaker": "character name or empty string",
    "gender": "male|female|unknown"}
 ]}
 
 Rules:
-- bbox coordinates MUST be absolute pixel positions in the image you see
-  (top-left origin), NOT normalized 0-1000 or 0-999 values.
-- bbox must tightly enclose the WHOLE text block (all lines of one bubble).
+- The image is exactly {W} wide and {H} tall. bbox coordinates MUST be
+  absolute pixel positions within THAT image (top-left origin). Never use
+  normalized 0-1000 or 0-999 values, even if you were trained that way.
+- One entry per bubble / text block; bbox must tightly enclose the WHOLE
+  text block (all lines of one bubble) — not the whole page, not half of it.
 - Read the text EXACTLY as written, including punctuation and casing.
 - SFX = stylized onomatopoeia drawn into the art (BOOM, WHOOSH...).
 - speaker = the character speaking this bubble, if identifiable from the page,
   else "". gender = the SPEAKER's gender.
+- confidence >= 0.85 only for text you can transcribe verbatim.
 - If there is no text, return {"regions": []}.
 """
 
@@ -75,7 +83,9 @@ class _VisionClient:
             "messages": [{
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": _PROMPT},
+                    {"type": "text",
+                     "text": _PROMPT.format(W=small.shape[1],
+                                            H=small.shape[0])},
                     {"type": "image_url",
                      "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                 ],
@@ -133,6 +143,10 @@ class VisionOCR:
         sh, sw = int(round(w * scale)), int(round(h * scale))
         raw_items = list(data.get("regions") or data.get("items")
                          or data.get("texts") or [])
+        # user-tunable floor (ocr.min_confidence); models that omit the
+        # confidence field keep the historical default of 0.9.
+        min_conf = float(self._app_cfg.get("ocr", "min_confidence",
+                                           default=0.35))
 
         # --- coordinate-space guard -------------------------------------
         # Several vision models (Qwen-VL and friends) return bboxes in a
@@ -175,6 +189,16 @@ class VisionOCR:
             text = str(item.get("text", "")).strip()
             if not text:
                 continue
+            try:
+                conf = float(item.get("confidence", 0.9))
+            except (TypeError, ValueError):
+                conf = 0.9
+            conf = min(1.0, max(0.0, conf))
+            if conf < min_conf:
+                log.debug("vision: dropped low-confidence region %r (%.2f)",
+                          text[:40], conf)
+                rejected += 1
+                continue
             rtype = _parse_type(item.get("type"))
             gender = str(item.get("gender") or "").strip().lower() or None
             if gender not in ("male", "female", "unknown"):
@@ -183,15 +207,32 @@ class VisionOCR:
                 id=0,
                 quad=quad,
                 english=text,
-                ocr_conf=0.9,  # vision read; no per-word confidence exists
+                ocr_conf=conf,
                 region_type=rtype,
                 speaker=str(item.get("speaker") or "") or None,
                 speaker_gender=gender,
                 orientation=_reported_orientation(item, quad),
             )
             region.qa_flags.append("vision_ocr")
+            if conf < 0.5:
+                region.qa_flags.append("low_ocr_confidence")
             regions.append(region)
-        return regions
+        # duplicate suppression: models sometimes emit the same bubble twice
+        # (or nested boxes). Keep the higher-confidence copy so the translator
+        # does not produce two competing Arabic strings for one bubble.
+        kept: List[TextRegion] = []
+        for r in sorted(regions, key=lambda x: -x.ocr_conf):
+            dup_of = None
+            for k in kept:
+                if _iou(r.quad.bbox, k.quad.bbox) >= 0.85:
+                    dup_of = k
+                    break
+            if dup_of is not None:
+                log.debug("vision: dropped duplicate %r (kept %r)",
+                          r.english[:30], dup_of.english[:30])
+                continue
+            kept.append(r)
+        return kept
 
 
 def _infer_coord_scales(raw_items: List[dict], sent_w: int,
@@ -321,6 +362,17 @@ def _infer_coord_scales(raw_items: List[dict], sent_w: int,
               "normalized grid explains them fully; keeping pixel space",
               sent_w, sent_h)
     return 1.0, 1.0
+
+
+def _iou(b1, b2) -> float:
+    """Intersection-over-union of two (x0, y0, x1, y1) bbox tuples."""
+    ix = max(0.0, min(b1[2], b2[2]) - max(b1[0], b2[0]))
+    iy = max(0.0, min(b1[3], b2[3]) - max(b1[1], b2[1]))
+    inter = ix * iy
+    a1 = max(0.0, b1[2] - b1[0]) * max(0.0, b1[3] - b1[1])
+    a2 = max(0.0, b2[2] - b2[0]) * max(0.0, b2[3] - b2[1])
+    union = a1 + a2 - inter
+    return inter / union if union > 0 else 0.0
 
 
 def _reported_orientation(item: dict, quad: Quad) -> float:
