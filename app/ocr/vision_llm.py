@@ -87,10 +87,22 @@ class _VisionClient:
             "Content-Type": "application/json",
         })
         resp.raise_for_status()
-        reply = resp.json()["choices"][0]["message"]["content"]
+        payload = resp.json()
+        choice = payload["choices"][0]["message"]
+        reply = choice.get("content")
+        # Some OpenAI-compatible gateways (Gemini via OpenRouter etc.) put the
+        # answer in `reasoning` or split it across content parts when the
+        # model hits max_tokens with no finish_reason handling.
+        if not reply:
+            reply = choice.get("reasoning") or ""
+        if isinstance(reply, list):  # multimodal-style content parts
+            reply = "".join(p.get("text", "") for p in reply
+                            if isinstance(p, dict))
         data = extract_json(reply)
         if not isinstance(data, dict):
-            raise ValueError("vision reply is not a JSON object")
+            raise ValueError(f"vision reply is not a JSON object "
+                             f"(finish_reason={payload['choices'][0].get('finish_reason')}, "
+                             f"reply head={reply[:120]!r})")
         data["_scale"] = scale
         return data
 
@@ -119,7 +131,8 @@ class VisionOCR:
         inv = 1.0 / max(1e-6, scale)
         h, w = image_bgr.shape[:2]
         sh, sw = int(round(w * scale)), int(round(h * scale))
-        raw_items = list(data.get("regions", []))
+        raw_items = list(data.get("regions") or data.get("items")
+                         or data.get("texts") or [])
 
         # --- coordinate-space guard -------------------------------------
         # Several vision models (Qwen-VL and friends) return bboxes in a

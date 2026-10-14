@@ -26,10 +26,17 @@ class OCRService:
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
         self._engine = EasyOCREngine()
+        # sticky backend: once vision proves itself broken (exception or an
+        # empty page) on this run, stop paying for a doomed API call per page
+        self._vision_broken = False
 
     def detect_and_read(self, image: np.ndarray) -> List[TextRegion]:
         backend = self.cfg.get("ocr", "backend", default="auto")
-        use_vision = backend == "vision" or backend == "auto"
+        # explicit "vision" always tries vision (the user asked for it);
+        # "auto" gives up on vision after the first hard failure so a broken
+        # LLM config doesn't add a doomed API call to every page.
+        use_vision = backend == "vision" or (backend == "auto"
+                                             and not self._vision_broken)
         if use_vision:
             regions = self._try_vision(image)
             if regions is not None:
@@ -48,10 +55,15 @@ class OCRService:
         try:
             regions = vo.detect_and_read(image)
         except Exception as e:
-            log.warning("vision OCR failed (%s); falling back to EasyOCR", e)
+            self._vision_broken = True
+            log.warning("vision OCR failed (%s); falling back to EasyOCR "
+                        "for the rest of this run", e)
             return None
         if not regions:
-            log.warning("vision OCR returned no regions; falling back to EasyOCR")
+            # A manhwa page with zero text is possible but rare; one empty
+            # reply alone shouldn't disable the backend permanently.
+            log.warning("vision OCR returned no regions; falling back to "
+                        "EasyOCR for this page")
             return None
         # color sampling still needs the original page. Vision bboxes are
         # whole-bubble blocks: the tight-crop border median would pick the

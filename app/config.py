@@ -160,6 +160,16 @@ class AppConfig:
             self.set(os.environ["MANHWA_INPAINT_BACKEND"], "inpainting", "backend")
         if os.environ.get("MANHWA_OCR_BACKEND"):
             self.set(os.environ["MANHWA_OCR_BACKEND"], "ocr", "backend")
+        # Convenience: forcing the translation LLM without also setting
+        # MANHWA_OCR_BACKEND implies the user wants vision OCR (that is the
+        # only place the LLM affects detection/reading). Without this, an
+        # env-var-only setup silently keeps the old EasyOCR path and none of
+        # the vision-LLM fixes ever run. "auto" behaves identically when a
+        # key is present, so only upgrade the default "auto" value.
+        elif os.environ.get("MANHWA_LLM_API_KEY") or os.environ.get(
+                "MANHWA_LLM_MODEL"):
+            if self.get("ocr", "backend", default="auto") == "auto":
+                self.set("vision", "ocr", "backend")
 
     def save(self, path: str) -> None:
         with open(path, "w", encoding="utf-8") as f:
