@@ -30,6 +30,8 @@ Return ONLY valid JSON:
 ]}
 
 Rules:
+- bbox coordinates MUST be absolute pixel positions in the image you see
+  (top-left origin), NOT normalized 0-1000 or 0-999 values.
 - bbox must tightly enclose the WHOLE text block (all lines of one bubble).
 - Read the text EXACTLY as written, including punctuation and casing.
 - SFX = stylized onomatopoeia drawn into the art (BOOM, WHOOSH...).
@@ -116,15 +118,36 @@ class VisionOCR:
         scale = float(data.get("_scale", 1.0))
         inv = 1.0 / max(1e-6, scale)
         h, w = image_bgr.shape[:2]
+        sh, sw = int(round(w * scale)), int(round(h * scale))
+        raw_items = list(data.get("regions", []))
+
+        # --- coordinate-space guard -------------------------------------
+        # Several vision models (Qwen-VL and friends) return bboxes in a
+        # normalized 0..1000 space even when the prompt asks for pixels.
+        # Interpreting those as raw pixels makes every box explode to the
+        # page corners, which destroys detection, masking and rendering.
+        # Detect the coordinate space from the batch of boxes and rescale.
+        sx, sy = _infer_coord_scales(raw_items, sw, sh)
+
         regions: List[TextRegion] = []
-        for item in data.get("regions", []):
+        rejected = 0
+        for item in raw_items:
             try:
-                x0, y0, x1, y1 = [float(v) * inv for v in item["bbox"][:4]]
+                x0, y0, x1, y1 = [float(v) for v in item["bbox"][:4]]
             except Exception:
+                rejected += 1
                 continue
+            # normalized -> sent-image pixels (per axis when the model used
+            # a non-square grid, e.g. Qwen-VL on portrait webtoon pages)
+            x0, x1 = x0 * sx, x1 * sx
+            y0, y1 = y0 * sy, y1 * sy
+            # back from the downscaled "sent" image to full resolution
+            x0, x1 = x0 * inv, x1 * inv
+            y0, y1 = y0 * inv, y1 * inv
             x0, x1 = sorted((max(0.0, x0), min(float(w), x1)))
             y0, y1 = sorted((max(0.0, y0), min(float(h), y1)))
             if x1 - x0 < 6 or y1 - y0 < 6:
+                rejected += 1
                 continue
             # LLM bboxes are eyeballed; reject degenerate/page-spanning boxes
             # exactly like the classical path does, otherwise one "crazy
@@ -134,6 +157,7 @@ class VisionOCR:
             if not OCRService._sane_quad(quad, image_bgr.shape, 0.20):
                 log.debug("vision: rejected implausible bbox %s",
                           (x0, y0, x1, y1))
+                rejected += 1
                 continue
             text = str(item.get("text", "")).strip()
             if not text:
@@ -155,6 +179,135 @@ class VisionOCR:
             region.qa_flags.append("vision_ocr")
             regions.append(region)
         return regions
+
+
+def _infer_coord_scales(raw_items: List[dict], sent_w: int,
+                        sent_h: int) -> tuple:
+    """Return ``(scale_x, scale_y)`` mapping the model's bbox numbers onto the
+    image we actually sent (``sent_w`` x ``sent_h`` pixels).
+
+    Most vision models return absolute pixel coordinates of the image they
+    were given. Qwen-VL-style models instead return values normalized to a
+    0..1000 grid regardless of the real resolution — and some return 0..1
+    floats. If we treat those as pixels, every box explodes toward the page
+    corners and the whole pipeline (masking, inpainting, rendering) is
+    destroyed.
+
+    Heuristic, evaluated over the whole batch so genuine pixel coords are
+    never shrunk:
+      - global max coord <= ~1.5 and min >= 0 -> 0..1 normalized floats
+      - boxes essentially all inside the sent image
+        as-is                                  -> pixels, (1.0, 1.0)
+      - otherwise                              -> some 0..1000 grid; we pick
+        the variant (per-axis free grid vs aspect-preserving square grid)
+        that puts more boxes inside the image.
+
+    For the 0..1000 case we first check the FREE-GRID hypothesis (x mapped by
+    sent_w/1000, y by sent_h/1000). If that still leaves most boxes outside
+    the image, the model used an ASPECT-PRESERVING square grid (the classic
+    Qwen-VL behaviour on portrait pages: both axes scaled by min(w,h)/1000)
+    and we switch to that. Applying the wrong variant shifts every bubble by
+    hundreds of pixels, so the fit is verified against actual containment
+    rather than guessed from a single signature.
+    """
+    boxes: List[tuple] = []
+    for item in raw_items:
+        try:
+            x0, y0, x1, y1 = [float(v) for v in item["bbox"][:4]]
+        except Exception:
+            continue
+        boxes.append((min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)))
+
+    if not boxes:
+        return 1.0, 1.0
+
+    vmax = max(max(b[2], b[3]) for b in boxes)
+    vmin = min(min(b[0], b[1]) for b in boxes)
+
+    # 0..1 normalized floats: on a real page nothing reaches even ~1.5 px;
+    # require the sent image to be clearly larger to avoid false positives.
+    if vmax <= 1.5 and vmin >= 0.0 and max(sent_w, sent_h) > 8:
+        log.warning("vision: bboxes look normalized to 0..1; rescaling to "
+                    "%dx%d", sent_w, sent_h)
+        return float(sent_w), float(sent_h)
+
+    def contained(sx: float, sy: float) -> int:
+        c = 0
+        for x0, y0, x1, y1 in boxes:
+            cx0, cy0, cx1, cy1 = x0 * sx, y0 * sy, x1 * sx, y1 * sy
+            if -2 <= cx0 and cx1 <= sent_w + 2 and -2 <= cy0 and cy1 <= sent_h + 2:
+                c += 1
+        return c
+
+    # Candidate coordinate spaces. Pixel space must contain (essentially) all
+    # boxes — with a small tolerance for eyeballed LLM overhang — otherwise
+    # the numbers are not pixels of the sent image at all.
+    tol = 0.02
+    n_min = max(1, int(len(boxes) * (1.0 - tol)))
+    n_pixel = contained(1.0, 1.0)
+    pixel_ok = n_pixel >= n_min
+
+    # A normalized grid is only plausible if some coordinate actually reaches
+    # into the top of the 0..1000 range; well-behaved pixel coords on huge
+    # pages must never be mistaken for a grid.
+    looks_gridish = vmax >= 600 or vmax > max(sent_w, sent_h)
+
+    free_s = (sent_w / 1000.0, sent_h / 1000.0)
+    sq = min(sent_w, sent_h) / 1000.0
+    square_s = (sq, sq)
+    n_free, n_square = contained(*free_s), contained(*square_s)
+
+    # Tie-breaker between "messy pixels" and a grid hypothesis that also
+    # contains everything: genuine pixel batches hug the image edges (bubbles
+    # spread across the whole page, so max coords sit close to W and H),
+    # whereas rescaled 0..1000 grid coords cluster in the middle of the range.
+    def pixel_extent() -> float:
+        fx = max((b[2] for b in boxes), default=0) / float(sent_w)
+        fy = max((b[3] for b in boxes), default=0) / float(sent_h)
+        # average axis utilisation; > ~0.85 means coords really reach the
+        # far edges of THIS image and are therefore almost certainly pixels.
+        return (fx + fy) / 2.0
+
+    all_ints = all(float(v).is_integer() for b in boxes for v in b)
+    edge_hugging = pixel_extent() > 0.85
+
+    if pixel_ok:
+        # Pixel space contains the batch. A grid hypothesis is strictly more
+        # likely when it explains every box while raw pixels leave at least
+        # one box outside the image (eyeballed grids overshoot constantly;
+        # genuine LLM pixel coords rarely do across a whole page) — unless
+        # the values clearly track this image's own dimensions.
+        ambiguous = (looks_gridish and max(n_free, n_square) == len(boxes)
+                     and n_pixel < len(boxes))
+        if ambiguous and not edge_hugging and all_ints:
+            pass  # fall through to the grid branch below
+        else:
+            return 1.0, 1.0
+
+    # Normalized 0..1000 grid: pick whichever variant actually fits the image.
+    best_n = max(n_free, n_square)
+    grid_ok = looks_gridish and best_n >= n_min
+    if grid_ok:
+        if n_square > n_free:
+            log.warning("vision: bboxes fit an aspect-preserving 0..1000 "
+                        "square grid (%d/%d inside %dx%d); rescaling by %.4f",
+                        n_square, len(boxes), sent_w, sent_h, sq)
+            return square_s
+        log.warning("vision: bboxes fit a per-axis 0..1000 grid (%d/%d inside "
+                    "%dx%d); rescaling", n_free, len(boxes), sent_w, sent_h)
+        return free_s
+    if pixel_ok:
+        return 1.0, 1.0
+    if n_free == 0 and n_square == 0:
+        # Nothing fits any hypothesis; last resort is the per-axis grid since
+        # coordinates get clamped to the page afterwards anyway.
+        log.warning("vision: bbox values don't fit the %dx%d sent image; "
+                    "falling back to per-axis 0..1000 rescale", sent_w, sent_h)
+        return free_s
+    log.debug("vision: bboxes partially outside the %dx%d sent image but no "
+              "normalized grid explains them fully; keeping pixel space",
+              sent_w, sent_h)
+    return 1.0, 1.0
 
 
 def _reported_orientation(item: dict, quad: Quad) -> float:
