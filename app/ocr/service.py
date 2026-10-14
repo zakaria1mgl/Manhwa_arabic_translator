@@ -53,10 +53,46 @@ class OCRService:
         if not regions:
             log.warning("vision OCR returned no regions; falling back to EasyOCR")
             return None
-        # color sampling still needs the original page
+        # color sampling still needs the original page. Vision bboxes are
+        # whole-bubble blocks: the tight-crop border median would pick the
+        # bubble *outline* as bg_color and flood-fill it as text colour on
+        # dark-outlined bubbles. Sample the interior instead: background =
+        # modal bright cluster, text = cluster far from it.
         for r in regions:
-            self._sample_colors(r, image)
+            self._sample_colors_interior(r, image)
         return regions
+
+    def _sample_colors_interior(self, region: TextRegion, image: np.ndarray,
+                                pad: int = 4) -> None:
+        """Interior-cluster colour sampling for vision block bboxes."""
+        try:
+            crop = self._crop(image, region.quad, pad=pad)
+            if crop is None or crop.ndim != 3 or crop.shape[2] != 3:
+                return
+            h, w = crop.shape[:2]
+            if h < 8 or w < 8:
+                self._sample_colors(region, image)
+                return
+            inner = crop[pad + 1:h - pad - 1, pad + 1:w - pad - 1]
+            px = inner.reshape(-1, 3).astype(np.float32)
+            lum = px.mean(axis=1)
+            # bubble interiors are usually light; fall back to dark-mode
+            # (white-on-black narration) when the interior is mostly dark
+            face_mask = lum >= 120 if float(np.median(lum)) >= 100 else lum <= 135
+            face_px = px[face_mask]
+            if len(face_px) < max(6, 0.05 * len(px)):
+                face_px = px
+            region.bg_color = tuple(int(v) for v in np.median(face_px, axis=0))
+            diff = np.abs(px - np.array(region.bg_color)).sum(axis=1)
+            ink = px[diff > 150]
+            if len(ink) >= 4:
+                region.text_color = tuple(int(v) for v in np.median(ink, axis=0))
+            else:
+                # no clear ink cluster inside the block box — reuse the
+                # proven tight-crop heuristic on the same region
+                self._sample_colors(region, image)
+        except Exception as e:  # pragma: no cover
+            log.debug("vision color sampling failed: %s", e)
 
     def _postprocess(self, image: np.ndarray,
                      regions: List[TextRegion]) -> List[TextRegion]:

@@ -126,22 +126,51 @@ class VisionOCR:
             y0, y1 = sorted((max(0.0, y0), min(float(h), y1)))
             if x1 - x0 < 6 or y1 - y0 < 6:
                 continue
+            # LLM bboxes are eyeballed; reject degenerate/page-spanning boxes
+            # exactly like the classical path does, otherwise one "crazy
+            # diagonal" region masks half the page during removal.
+            quad = Quad(points=[(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+            from .service import OCRService  # local import: no cycle at runtime
+            if not OCRService._sane_quad(quad, image_bgr.shape, 0.20):
+                log.debug("vision: rejected implausible bbox %s",
+                          (x0, y0, x1, y1))
+                continue
             text = str(item.get("text", "")).strip()
             if not text:
                 continue
             rtype = _parse_type(item.get("type"))
+            gender = str(item.get("gender") or "").strip().lower() or None
+            if gender not in ("male", "female", "unknown"):
+                gender = None
             region = TextRegion(
                 id=0,
-                quad=Quad(points=[(x0, y0), (x1, y0), (x1, y1), (x0, y1)]),
+                quad=quad,
                 english=text,
                 ocr_conf=0.9,  # vision read; no per-word confidence exists
                 region_type=rtype,
                 speaker=str(item.get("speaker") or "") or None,
-                speaker_gender=str(item.get("gender") or "") or None,
+                speaker_gender=gender,
+                orientation=_reported_orientation(item, quad),
             )
             region.qa_flags.append("vision_ocr")
             regions.append(region)
         return regions
+
+
+def _reported_orientation(item: dict, quad: Quad) -> float:
+    """Honour an explicit `rotated`/`orientation` hint when the model gives
+    one; otherwise infer vertical lettering from geometry (tall + narrow =
+    vertical SFX/sign column) so downstream mask/crop logic rotates correctly.
+    """
+    raw = item.get("orientation")
+    if isinstance(raw, (int, float)) and abs(float(raw)) > 5:
+        return float(raw)
+    if item.get("rotated") and quad.height > 1.8 * max(1.0, quad.width):
+        return 90.0
+    if quad.height > 2.2 * max(1.0, quad.width):
+        # purely geometric guess for vertical text blocks
+        return 90.0
+    return 0.0
 
 
 def _parse_type(value: Any) -> RegionType:
