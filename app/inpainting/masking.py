@@ -16,6 +16,27 @@ def _odd(n: int) -> int:
     return n if n % 2 == 1 else n + 1
 
 
+def _median_blur_safe(img: np.ndarray, k: int) -> np.ndarray:
+    """cv2.medianBlur with an OpenCV-safe kernel.
+
+    OpenCV asserts `k < 16` in its optimized 8u median path
+    (median_blur.simd.hpp), so kernels >= 16 crash on large text / big
+    bubble ROIs. Emulate a larger median by applying the maximum legal
+    kernel repeatedly — each pass further removes sparse strokes while
+    preserving smooth gradients, which is exactly what these local
+    background estimates need.
+    """
+    import cv2
+    k = _odd(k)
+    if k <= 15:
+        return cv2.medianBlur(img, k)
+    out = img
+    passes = min(6, (k + 14) // 15)   # approximate the requested smoothing
+    for _ in range(passes):
+        out = cv2.medianBlur(out, 15)
+    return out
+
+
 def build_text_mask(image: np.ndarray, regions: List[TextRegion], *,
                     dilate_px: int = 4,
                     uniform_tolerance: int = 18) -> np.ndarray:
@@ -45,9 +66,10 @@ def build_text_mask(image: np.ndarray, regions: List[TextRegion], *,
         quad_area = float((x1 - x0) * (y1 - y0))
 
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        # kernel sized to the text: bigger for SFX/large text
+        # kernel sized to the text: bigger for SFX/large text (capped &
+        # multi-passed inside _median_blur_safe — OpenCV asserts k < 16)
         k = _odd(max(21, int(0.6 * (r.bbox[3] - r.bbox[1]))))
-        bg_local = cv2.medianBlur(gray, k)
+        bg_local = _median_blur_safe(gray, k)
         diff = cv2.absdiff(gray, bg_local)
         text_px = (diff > 55) & (local_mask > 0)
         local_mask = text_px.astype(np.uint8) * 255
@@ -140,8 +162,9 @@ def uniform_bubble_fill(image: np.ndarray, regions: List[TextRegion],
         if roi.size == 0:
             continue
         # local median background: keeps gradients/shading, drops thin strokes
+        # (kernel may exceed OpenCV's k<16 limit on tall bubbles → safe path)
         k = _odd(max(21, int(0.5 * (y1 - y0))))
-        local_bg_bgr = cv2.medianBlur(roi, k)
+        local_bg_bgr = _median_blur_safe(roi, k)
         poly_mask = np.zeros(roi.shape[:2], dtype=np.uint8)
         shifted = hull_i - np.array([[[x0, y0]]], dtype=np.int32)
         cv2.fillPoly(poly_mask, [shifted], 255)
