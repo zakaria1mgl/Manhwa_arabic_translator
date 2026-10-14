@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import List, Optional
 
+import cv2
 import numpy as np
 
 from ..config import AppConfig
@@ -65,6 +66,15 @@ class OCRService:
             log.warning("vision OCR returned no regions; falling back to "
                         "EasyOCR for this page")
             return None
+        # Vision models return eyeballed block bboxes that routinely overlap
+        # neighbouring bubbles or bleed into artwork. The classical path never
+        # saw this because its boxes hug individual text lines. Shrink each
+        # vision box to the actual ink extent inside it (tight bbox of dark/
+        # light text pixels), so masking, bubble-contour snapping and Arabic
+        # fitting all operate on real text geometry instead of a hallucinated
+        # oversized rectangle. Boxes we cannot tighten are left untouched.
+        for r in regions:
+            self._tighten_vision_quad(r, image)
         # color sampling still needs the original page. Vision bboxes are
         # whole-bubble blocks: the tight-crop border median would pick the
         # bubble *outline* as bg_color and flood-fill it as text colour on
@@ -73,6 +83,117 @@ class OCRService:
         for r in regions:
             self._sample_colors_interior(r, image)
         return regions
+
+    @staticmethod
+    def _tighten_vision_quad(region: TextRegion, image: np.ndarray,
+                             grow_px: int = 4) -> None:
+        """Replace a vision block bbox with the tight rect around readable
+        ink (text strokes) found inside it. Supports black-on-white bubbles
+        and white-on-dark narration boxes; skips rotated/SFX regions."""
+        try:
+            if abs(float(region.orientation)) > 5:
+                return
+            h, w = image.shape[:2]
+            x0, y0, x1, y1 = region.quad.bbox
+            bx0, by0 = max(0, int(x0)), max(0, int(y0))
+            bx1, by1 = min(w, int(x1)), min(h, int(y1))
+            if bx1 - bx0 < 12 or by1 - by0 < 12:
+                return
+            crop = image[by0:by1, bx0:bx1]
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), 60, 150)
+            # merge stroke fragments into whole words/glyphs before measuring
+            # the ink extent: raw Canny contours are fragmented and leak a few
+            # stray pixels toward the container border.
+            ksz = max(3, int(0.18 * min(by1 - by0, bx1 - bx0)) | 1)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
+            best_mask = None
+            for thr in (cv2.THRESH_BINARY_INV, cv2.THRESH_BINARY):
+                m = cv2.threshold(gray, 0, 255,
+                                  thr + cv2.THRESH_OTSU)[1]
+                # drop the bubble/box OUTLINE from the ink candidate: it is a
+                # long thin curve hugging the container border, text strokes
+                # are compact components strictly inside.
+                m = cv2.bitwise_and(m, edges)
+                m = self._drop_border_components(m, by0, by1, bx0, bx1,
+                                                 image.shape[:2])
+                cov = float(np.count_nonzero(m)) / float(m.size)
+                if 0.004 <= cov <= 0.45:
+                    best_mask = cv2.dilate(m, kernel)
+                    break
+            if best_mask is None:
+                return
+            ys, xs = np.nonzero(best_mask)
+            if len(xs) < 12:
+                return
+            tx0 = bx0 + int(xs.min()) - grow_px
+            ty0 = by0 + int(ys.min()) - grow_px
+            tx1 = bx0 + int(xs.max()) + 1 + grow_px
+            ty1 = by0 + int(ys.max()) + 1 + grow_px
+            tx0, ty0 = max(0, tx0), max(0, ty0)
+            tx1, ty1 = min(w, tx1), min(h, ty1)
+            nw, nh = tx1 - tx0, ty1 - ty0
+            if nw < 8 or nh < 8:
+                return
+            oldw, oldh = x1 - x0, y1 - y0
+            # trust the tightening only when it meaningfully shrinks the box
+            # AND the result remains plausible for one text block; otherwise
+            # JPEG speckle could carve the box down to a single glyph.
+            if (nw * nh) >= 0.92 * oldw * oldh:
+                return
+            if nh > 0.75 * h or nw > 0.75 * w:
+                return
+            region.quad = Quad(points=[(float(tx0), float(ty0)),
+                                       (float(tx1), float(ty0)),
+                                       (float(tx1), float(ty1)),
+                                       (float(tx0), float(ty1))])
+        except Exception as e:  # pragma: no cover
+            log.debug("vision quad tightening failed: %s", e)
+
+    @staticmethod
+    def _drop_border_components(m: np.ndarray, by0: int, by1: int,
+                                bx0: int, bx1: int, page_shape) -> np.ndarray:
+        """Remove connected components that touch the crop border or are huge
+        curves — i.e. bubble/panel outlines and artwork edges — keeping only
+        interior stroke-like components (text)."""
+        try:
+            ch, cw = m.shape[:2]
+            n, lab, stats, _ = cv2.connectedComponentsWithStats(
+                (m > 0).astype(np.uint8), connectivity=8)
+            if n <= 1:
+                return m
+            # text is a dense cluster in the middle of a vision block box;
+            # outline/artwork speckle sits at the extremes. Measure each
+            # component's distance from the batch centroid in units of the
+            # median component size, and drop far-flung outliers. Use the
+            # MEDIAN position (not mean): with more than half the components
+            # being border speckle, the mean drifts toward the speckle and
+            # keeps it while discarding the real text.
+            centers = np.array([[stats[i][0] + stats[i][2] / 2.0,
+                                 stats[i][1] + stats[i][3] / 2.0]
+                                for i in range(1, n)])
+            sizes = np.maximum(stats[1:, 2], stats[1:, 3]).astype(float)
+            med_size = max(4.0, float(np.median(sizes)))
+            cx, cy = np.median(centers, axis=0)
+            dist = np.sqrt(((centers[:, 0] - cx) ** 2
+                            + (centers[:, 1] - cy) ** 2))
+            out = np.zeros_like(m)
+            kept = 0
+            for i in range(1, n):
+                x, y, w, h, area = stats[i]
+                touches = (x <= 1 or y <= 1
+                           or x + w >= cw - 1 or y + h >= ch - 1)
+                spans = (w > 0.9 * cw and h > 0.9 * ch)
+                outlier = dist[i - 1] > 5.0 * med_size
+                if touches or spans or outlier or area < 4:
+                    continue
+                out[lab == i] = 255
+                kept += 1
+            if kept >= 3 and np.count_nonzero(out) >= 12:
+                return out
+            return m
+        except Exception:
+            return m
 
     def _sample_colors_interior(self, region: TextRegion, image: np.ndarray,
                                 pad: int = 4) -> None:
@@ -202,7 +323,6 @@ class OCRService:
             if (not eng or conf < min_conf) and quad.height > 1.8 * quad.width:
                 crop = self._crop(image, quad)
                 if crop is not None:
-                    import cv2
                     for rot in (cv2.ROTATE_90_CLOCKWISE,
                                 cv2.ROTATE_90_COUNTERCLOCKWISE):
                         rc = cv2.rotate(crop, rot)
