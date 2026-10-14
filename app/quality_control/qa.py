@@ -17,6 +17,20 @@ _LATIN_RE = re.compile(r"[A-Za-z]{2,}")
 
 def region_qa(region: TextRegion, cfg: AppConfig) -> float:
     """Score one region 0..1 and append flags."""
+    # Merged satellites (multi-line bubbles folded into one translation unit
+    # by merge_bubble_lines) intentionally carry empty english/arabic — they
+    # are NOT failures. Scoring them normally produced guaranteed false
+    # `empty_ocr` + `missing_translation` flags on every multi-line bubble,
+    # which dragged the page score down and triggered pointless LLM retries.
+    # Carry over any layout flags that were recorded before the merge, then
+    # mark the region as passed; the primary carries the real QA.
+    if region.merged_into is not None:
+        carried = [f for f in region.qa_flags
+                   if f in ("text_overflow_risk", "layout_failed")]
+        region.qa_flags = list(dict.fromkeys(carried))
+        region.qa_score = 1.0
+        return region.qa_score
+
     flags: List[str] = []
     score = 1.0
 
@@ -57,7 +71,14 @@ def page_qa(page: PageResult, cfg: AppConfig) -> float:
     if not page.regions:
         page.page_qa_score = 1.0
         return 1.0
-    scores = [r.qa_score for r in page.regions]
+    # Score on *translation units*, not raw regions: merged satellites always
+    # score 1.0 after region_qa, so averaging them in dilutes a broken
+    # bubble (e.g. 1 failing primary + 3 satellites = 0.75 avg, hiding the
+    # failure). Primaries carry the real quality; the worst-region term is
+    # taken over primaries only for the same reason.
+    primaries = [r for r in page.regions if r.merged_into is None]
+    scored = primaries or page.regions  # all-satellite edge case fallback
+    scores = [r.qa_score for r in scored]
     avg = float(np.mean(scores))
     worst = min(scores)
     # page score blends average with the worst region (a broken bubble hurts)
@@ -103,9 +124,12 @@ def visual_render_check(original_bgr: np.ndarray, cleaned_bgr: np.ndarray,
 
 def residual_english_check(rendered_bgr: np.ndarray, regions: List[TextRegion],
                            ocr_engine) -> List[str]:
-    """Re-OCR the rendered page around each region; report leftover English."""    """Re-OCR the rendered page around each region; report leftover English."""
+    """Re-OCR the rendered page around each region; report leftover English."""
     leftovers: List[str] = []
     for r in regions:
+        if r.merged_into is not None:
+            continue  # satellite boxes live inside the primary's span; only
+                      # the primary needs a residual-English re-check
         x0, y0, x1, y1 = r.bbox
         h, w = rendered_bgr.shape[:2]
         pad = 4
@@ -121,11 +145,14 @@ def residual_english_check(rendered_bgr: np.ndarray, regions: List[TextRegion],
 
 
 def build_quality_report(page: PageResult) -> Dict:
-    flagged = [r for r in page.regions if r.qa_flags or r.qa_score < 0.7]
+    flagged = [r for r in page.regions if r.merged_into is None
+               and (r.qa_flags or r.qa_score < 0.7)]
     return {
         "page": page.image_path,
         "score": page.page_qa_score,
-        "regions_total": len(page.regions),
+        # report translation units, not raw regions — satellites are noise
+        "regions_total": len([r for r in page.regions
+                              if r.merged_into is None]),
         "regions_flagged": [
             {"id": r.id, "flags": r.qa_flags, "score": round(r.qa_score, 2),
              "english": r.english, "arabic": r.arabic}
