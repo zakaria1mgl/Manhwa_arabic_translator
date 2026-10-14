@@ -1,0 +1,24 @@
+# Core
+numpy>=1.24
+opencv-python-headless>=4.8
+Pillow>=10.0
+PyYAML>=6.0
+requests>=2.31
+gradio>=5.0              # gradio 4.x breaks with new huggingface_hub (HfFolder removed)
+
+# Arabic text shaping
+arabic-reshaper>=3.0
+python-bidi>=0.4
+
+# Detection + OCR (GPU used automatically when CUDA is available)
+easyocr>=1.7
+
+# Translation
+# - LLM backend: configure an OpenAI-compatible endpoint (Gemini/OpenAI/local vLLM)
+transformers>=4.40          # offline fallback: Helsinki-NLP/opus-mt-en-ar
+torch>=2.1
+sentencepiece>=0.1.99
+sacremoses>=0.0.53
+
+# Inpainting (best quality; optional on CPU)
+simple-lama-inpainting>=0.1
